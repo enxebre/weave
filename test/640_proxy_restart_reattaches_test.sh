@@ -2,8 +2,6 @@
 
 . ./config.sh
 
-C1=10.2.0.78
-C2=10.2.0.34
 NAME=seetwo.weave.local
 
 check_attached() {
@@ -14,8 +12,9 @@ check_attached() {
 start_suite "Proxy restart reattaches networking to containers"
 
 WEAVE_DOCKER_ARGS=--restart=always WEAVEPROXY_DOCKER_ARGS=--restart=always weave_on $HOST1 launch
-proxy_start_container          $HOST1 -e WEAVE_CIDR=$C2/24 -di --name=c2 --restart=always -h $NAME
-proxy_start_container_with_dns $HOST1 -e WEAVE_CIDR=$C1/24 -di --name=c1 --restart=always
+proxy_start_container          $HOST1 -di --name=c2 --restart=always -h $NAME
+proxy_start_container_with_dns $HOST1 -di --name=c1 --restart=always
+C2=$(container_ip $HOST1 c2)
 
 proxy docker_on $HOST1 restart -t=1 c2
 check_attached
@@ -33,6 +32,8 @@ check_attached
 # Restart docker itself, using different commands for systemd- and upstart-managed.
 run_on $HOST1 sh -c "command -v systemctl >/dev/null && sudo systemctl restart docker || sudo service docker restart"
 sleep 10
+# Re-fetch the IP since it is not retained on docker restart
+C2=$(container_ip $HOST1 c2)
 check_attached
 
 # Restarting proxy shouldn't kill unattachable containers
