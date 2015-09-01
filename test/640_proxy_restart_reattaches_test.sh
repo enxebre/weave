@@ -9,6 +9,16 @@ check_attached() {
     assert_dns_record $HOST1 c1 $NAME $C2
 }
 
+N=50
+# Create and remove a lot of containers in a small subnet; the failure
+# mode is that this takes a long time as it has to wait for the old
+# ones to time out, so we run this function inside 'timeout'
+run_many() {
+    for i in $(seq $N); do
+        proxy docker_on $HOST1 run -e WEAVE_CIDR=net:10.32.4.0/28 --rm -t $SMALL_IMAGE /bin/true
+    done
+}
+
 start_suite "Proxy restart reattaches networking to containers"
 
 WEAVE_DOCKER_ARGS=--restart=always WEAVEPROXY_DOCKER_ARGS=--restart=always weave_on $HOST1 launch
@@ -35,6 +45,8 @@ sleep 10
 # Re-fetch the IP since it is not retained on docker restart
 C2=$(container_ip $HOST1 c2)
 check_attached
+
+assert_raises "timeout 90 cat <( run_many )"
 
 # Restarting proxy shouldn't kill unattachable containers
 proxy_start_container $HOST1 -di --name=c3 --restart=always # Use ipam, so it won't be attachable w/o weave
