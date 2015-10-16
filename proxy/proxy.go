@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 	. "github.com/weaveworks/weave/common"
@@ -71,10 +72,22 @@ type Proxy struct {
 	weaveWaitVolume     string
 	normalisedAddrs     []string
 	waiters             map[*http.Request]*wait
+	attachContainer     chan attachJob
+	quit                chan struct{}
+}
+
+type attachJob struct {
+	id      string
+	retryAt time.Time
 }
 
 func NewProxy(c Config) (*Proxy, error) {
-	p := &Proxy{Config: c, waiters: make(map[*http.Request]*wait)}
+	p := &Proxy{
+		Config:          c,
+		waiters:         make(map[*http.Request]*wait),
+		attachContainer: make(chan attachJob),
+		quit:            make(chan struct{}),
+	}
 
 	if err := p.TLSConfig.LoadCerts(); err != nil {
 		Log.Fatalf("Could not configure tls for proxy: %s", err)
@@ -111,21 +124,15 @@ func NewProxy(c Config) (*Proxy, error) {
 
 	client.AddObserver(p)
 
+	go p.containerAttachLoop()
+
 	return p, nil
 }
 
 func (proxy *Proxy) AttachExistingContainers() {
 	containers, _ := proxy.client.ListContainers(docker.ListContainersOptions{})
 	for _, apiContainer := range containers {
-		container, err := proxy.client.InspectContainer(apiContainer.ID)
-		if err != nil {
-			Log.Warningf("Error inspecting container %s: %v", apiContainer.ID, err)
-			continue
-		}
-		if containerShouldAttach(container) {
-			proxy.attach(container, false)
-		}
-		proxy.notifyWaiters(container.ID)
+		proxy.attachContainer <- attachJob{id: apiContainer.ID, retryAt: time.Now()}
 	}
 }
 
@@ -294,16 +301,7 @@ func (proxy *Proxy) listen(protoAndAddr string) (net.Listener, string, error) {
 
 // weavedocker.ContainerObserver interface
 func (proxy *Proxy) ContainerStarted(ident string) {
-	container, err := proxy.client.InspectContainer(ident)
-	if err != nil {
-		Log.Warningf("Error inspecting container %s: %v", ident, err)
-		return
-	}
-	// If this was a container we modified the entrypoint for, attach it to the network
-	if containerShouldAttach(container) {
-		proxy.attach(container, true)
-	}
-	proxy.notifyWaiters(container.ID)
+	proxy.attachContainer <- attachJob{id: ident}
 }
 
 func containerShouldAttach(container *docker.Container) bool {
@@ -351,10 +349,19 @@ func (proxy *Proxy) waitForStart(r *http.Request) {
 func (proxy *Proxy) ContainerDied(ident string) {
 }
 
-func (proxy *Proxy) attach(container *docker.Container, orDie bool) error {
+func (proxy *Proxy) attach(containerID string, orDie bool) error {
+	container, err := proxy.client.InspectContainer(containerID)
+	if err != nil {
+		Log.Warningf("Error inspecting container %s: %v", containerID, err)
+		return nil
+	}
+	if !containerShouldAttach(container) {
+		return nil
+	}
+
 	cidrs, err := proxy.weaveCIDRs(container.HostConfig.NetworkMode, container.Config.Env)
 	if err != nil {
-		Log.Infof("Leaving container %s alone because %s", container.ID, err)
+		Log.Infof("Leaving container %s alone because %s", containerID, err)
 		return nil
 	}
 	Log.Infof("Attaching container %s with WEAVE_CIDR \"%s\" to weave network", container.ID, strings.Join(cidrs, " "))
@@ -466,4 +473,39 @@ func (proxy *Proxy) getDNSDomain() (domain string) {
 	}
 
 	return string(b)
+}
+
+// containerAttachLoop manages container attachment retry timers, to ensure
+// that failed containers are retried. new containers should be sent to
+// proxy.attachContainer
+func (proxy *Proxy) containerAttachLoop() {
+	var (
+		a              attachJob
+		nextRetry      <-chan time.Time
+		pendingRetries []attachJob
+	)
+	for {
+		if len(pendingRetries) > 0 && nextRetry == nil {
+			nextRetry = time.After(pendingRetries[0].retryAt.Sub(time.Now()))
+		}
+		select {
+		case <-nextRetry:
+			nextRetry = nil
+			a = pendingRetries[0]
+			pendingRetries = pendingRetries[1:]
+		case a = <-proxy.attachContainer:
+		case <-proxy.quit:
+			return
+		}
+		if err := proxy.attach(a.id, a.retryAt.IsZero()); err != nil && !a.retryAt.IsZero() {
+			a.retryAt = time.Now().Add(10 * time.Second)
+			pendingRetries = append(pendingRetries, a)
+		} else {
+			proxy.notifyWaiters(a.id)
+		}
+	}
+}
+
+func (proxy *Proxy) Stop() {
+	close(proxy.quit)
 }

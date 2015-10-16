@@ -60,6 +60,7 @@ func main() {
 	if err != nil {
 		Log.Fatalf("Could not start proxy: %s", err)
 	}
+	defer p.Stop()
 
 	listeners := p.Listen()
 	p.AttachExistingContainers()
