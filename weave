@@ -1264,6 +1264,10 @@ host_arg() {
       echo "When launching the proxy, unix sockets must be specified as an absolute path." >&2
       exit 1
     fi
+    if [ "$host" != "${host#/var/run/}" ]; then
+      echo "WARNING: When launching the proxy, unix sockets directly in /var/run can lead to a bug with net namespace cleanup." >&2
+      echo "For more info, see https://github.com/weaveworks/weave/issues/1455" >&2
+    fi
     PROXY_VOLUMES="$PROXY_VOLUMES -v $host:/host$host"
     PROXY_ARGS="$PROXY_ARGS -H /host$host/$(basename ${PROXY_HOST#unix://})"
   else
